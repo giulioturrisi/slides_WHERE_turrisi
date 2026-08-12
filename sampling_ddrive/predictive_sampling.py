@@ -34,7 +34,7 @@ class Sampling_MPC:
         self,
         horizon=80,
         dt=0.05,
-        num_computations=1000,
+        num_computations=10,
         init_jax=True,
         interpolation="zero_order",
         obstacles=None,
@@ -42,9 +42,10 @@ class Sampling_MPC:
         safety_margin=0.15,
         goal_tolerance=0.10,
         seed=42,
-        sample_deltas=True,
+        sample_deltas=False,
         delta_v_max=0.25,
         delta_w_max=0.50,
+        print_computation_time=True,
     ):
         self.horizon = horizon
         self.dt = dt
@@ -59,7 +60,10 @@ class Sampling_MPC:
         self.sample_deltas = sample_deltas
         self.delta_v_max = delta_v_max
         self.delta_w_max = delta_w_max
+        self.print_computation_time = print_computation_time
         self.previous_parameters = None
+        self.seed = seed
+        self.rng_key = random.PRNGKey(seed)
         self.obstacles = jnp.asarray(
             [] if obstacles is None else obstacles, dtype=jnp.float32
         ).reshape((-1, 3))
@@ -89,37 +93,7 @@ class Sampling_MPC:
             interpolation_functions[self.interpolation]
         )
 
-        key_v, key_w, key_delta_v, key_delta_w = random.split(
-            random.PRNGKey(seed), 4
-        )
-        v_parameters = random.uniform(
-            key_v,
-            (self.num_computations, self.num_knots),
-            minval=-1.2,
-            maxval=1.2,
-        )
-        w_parameters = random.uniform(
-            key_w,
-            (self.num_computations, self.num_knots),
-            minval=-2.0,
-            maxval=2.0,
-        )
-        self.parameters_map = jnp.column_stack((v_parameters, w_parameters))
-        delta_v_parameters = random.uniform(
-            key_delta_v,
-            (self.num_computations, self.num_knots),
-            minval=-self.delta_v_max,
-            maxval=self.delta_v_max,
-        )
-        delta_w_parameters = random.uniform(
-            key_delta_w,
-            (self.num_computations, self.num_knots),
-            minval=-self.delta_w_max,
-            maxval=self.delta_w_max,
-        )
-        self.delta_parameters_map = jnp.column_stack(
-            (delta_v_parameters, delta_w_parameters)
-        )
+        self._resample_parameter_maps()
 
         vectorized_forward_sim = jax.vmap(
             self.compute_forward_simulations, in_axes=(0, None, 0), out_axes=0
@@ -137,6 +111,42 @@ class Sampling_MPC:
 
     def reset(self):
         self.previous_parameters = None
+        self.rng_key = random.PRNGKey(self.seed)
+
+    def _resample_parameter_maps(self):
+        """Sample a fresh candidate set and advance the internal PRNG key."""
+        self.rng_key, key_v, key_w, key_delta_v, key_delta_w = random.split(
+            self.rng_key, 5
+        )
+        v_parameters = random.uniform(
+            key_v,
+            (self.num_computations, self.num_knots),
+            minval=-1.2,
+            maxval=1.2,
+        )
+        w_parameters = random.uniform(
+            key_w,
+            (self.num_computations, self.num_knots),
+            minval=-2.0,
+            maxval=2.0,
+        )
+        self.parameters_map = jnp.column_stack((v_parameters, w_parameters))
+
+        delta_v_parameters = random.uniform(
+            key_delta_v,
+            (self.num_computations, self.num_knots),
+            minval=-self.delta_v_max,
+            maxval=self.delta_v_max,
+        )
+        delta_w_parameters = random.uniform(
+            key_delta_w,
+            (self.num_computations, self.num_knots),
+            minval=-self.delta_w_max,
+            maxval=self.delta_w_max,
+        )
+        self.delta_parameters_map = jnp.column_stack(
+            (delta_v_parameters, delta_w_parameters)
+        )
 
     def _shift_previous_parameters(self):
         """Advance the previous knot sequence by one controller time step."""
@@ -313,6 +323,7 @@ class Sampling_MPC:
         if distance <= self.goal_tolerance:
             return 0.0, 0.0
         start_time = time.time()
+        self._resample_parameter_maps()
         candidate_parameters = self._candidate_parameters()
         state_batch = jnp.tile(state, (self.num_computations, 1))
         costs = self.jit_vectorized_forward_sim(
@@ -322,7 +333,8 @@ class Sampling_MPC:
         if self.sample_deltas:
             self.previous_parameters = best_parameters
         v, w = self.control_profile_fun(best_parameters, 0)
-        print("computation time:", time.time() - start_time)
+        if self.print_computation_time:
+            print("computation time:", time.time() - start_time)
         return float(v), float(w)
 
 
