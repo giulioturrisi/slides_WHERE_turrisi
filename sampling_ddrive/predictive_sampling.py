@@ -1,381 +1,486 @@
 import os
 
-# Must be set before importing JAX, including indirectly through robot_model.
+# Force this process to use only the CPU. These variables must be set before
+# importing JAX, including indirectly through robot_model.
 os.environ["CUDA_VISIBLE_DEVICES"] = ""
 os.environ["JAX_PLATFORMS"] = "cpu"
 
-dir_path = os.path.dirname(os.path.realpath(__file__))
-
-import sys
-from robot_model import Robot
+import time
+from pathlib import Path
 
 import jax
 import jax.numpy as jnp
-from jax import jit
+import matplotlib.pyplot as plt
+import numpy as np
 from jax import random
+from matplotlib.animation import FuncAnimation, PillowWriter
+
+from robot_model import Robot
+
 
 print("jax.default_backend()", jax.default_backend())
-print("ax.devices()", jax.devices())
-#os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
-#os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = ".75"
-#jax.config.update('jax_platform_name', 'cpu')
-
-#gpu_device = jax.devices('gpu')[0]
-cpu_device = jax.devices('cpu')[0]
-
-import numpy as np
-import matplotlib.pyplot as plt #
-import time
-
-import copy 
+print("jax.devices()", jax.devices())
 
 
 class Sampling_MPC:
-    """This is a small class that implements a sampling based control law"""
+    """Sampling MPC for point-to-point differential-drive navigation.
 
+    Obstacles are fixed circles represented by ``[x, y, radius]``. The
+    controller receives only the current robot state and one goal pose; it does
+    not require a precomputed reference trajectory.
+    """
 
-    def __init__(self, horizon = 200, dt = 0.01, num_computations = 10000, init_jax = True, linear = True, device="cpu"):
-        """
-        Args:
-            horizon (int): how much to look into the future for optimizing the gains 
-            dt (int): desidered sampling time
-        """
+    def __init__(
+        self,
+        horizon=80,
+        dt=0.05,
+        num_computations=2000,
+        init_jax=True,
+        interpolation="cubic",
+        obstacles=None,
+        robot_radius=0.15,
+        safety_margin=0.15,
+        goal_tolerance=0.10,
+        seed=42,
+        sample_deltas=False,
+        delta_v_max=0.25,
+        delta_w_max=0.50,
+    ):
         self.horizon = horizon
         self.dt = dt
         self.state_dim = 3
         self.control_dim = 2
         self.num_computations = num_computations
-
-        self.device = cpu_device
-        
-        if(linear == True):
-            self.spline_fun = jax.jit(self.compute_linear_spline)
-        else:
-            self.spline_fun = jax.jit(self.compute_cubic_spline)
-
         self.robot = Robot(self.dt)
 
-        self.Q = jnp.identity(self.state_dim)
-        self.Q.at[0,0].set(0.0)
-        self.Q.at[1,1].set(0.0)
-        self.Q.at[2,2].set(0.0)
+        self.robot_radius = robot_radius
+        self.safety_margin = safety_margin
+        self.goal_tolerance = goal_tolerance
+        self.sample_deltas = sample_deltas
+        self.delta_v_max = delta_v_max
+        self.delta_w_max = delta_w_max
+        self.previous_parameters = None
+        self.obstacles = jnp.asarray(
+            [] if obstacles is None else obstacles, dtype=jnp.float32
+        ).reshape((-1, 3))
 
-        
+        self.goal_weight = 1.0
+        self.terminal_goal_weight = 30.0
+        self.heading_weight = 0.05
+        self.control_weight = 0.01
+        self.obstacle_weight = 250.0
+        self.collision_weight = 10000.0
 
-        self.R = jnp.identity(self.control_dim)
+        if interpolation not in {"zero_order", "linear", "cubic"}:
+            raise ValueError(
+                "interpolation must be 'zero_order', 'linear', or 'cubic'"
+            )
+        self.interpolation = interpolation
+        # Zero order samples one independent (v, w) pair per horizon step.
+        # Linear and cubic interpolation use eight knots per control profile.
+        self.num_knots = self.horizon if interpolation == "zero_order" else 8
+        self.num_parameters = 2 * self.num_knots
+        interpolation_functions = {
+            "zero_order": self.compute_zero_order_hold,
+            "linear": self.compute_linear_spline,
+            "cubic": self.compute_cubic_spline,
+        }
+        self.control_profile_fun = jax.jit(
+            interpolation_functions[self.interpolation]
+        )
 
-        self.num_parameters = 16
+        key_v, key_w, key_delta_v, key_delta_w = random.split(
+            random.PRNGKey(seed), 4
+        )
+        v_parameters = random.uniform(
+            key_v,
+            (self.num_computations, self.num_knots),
+            minval=-1.2,
+            maxval=1.2,
+        )
+        w_parameters = random.uniform(
+            key_w,
+            (self.num_computations, self.num_knots),
+            minval=-2.0,
+            maxval=2.0,
+        )
+        self.parameters_map = jnp.column_stack((v_parameters, w_parameters))
+        delta_v_parameters = random.uniform(
+            key_delta_v,
+            (self.num_computations, self.num_knots),
+            minval=-self.delta_v_max,
+            maxval=self.delta_v_max,
+        )
+        delta_w_parameters = random.uniform(
+            key_delta_w,
+            (self.num_computations, self.num_knots),
+            minval=-self.delta_w_max,
+            maxval=self.delta_w_max,
+        )
+        self.delta_parameters_map = jnp.column_stack(
+            (delta_v_parameters, delta_w_parameters)
+        )
 
-        # the first call of jax is very slow, hence we should do this since the beginning! ------------------
-        if(init_jax):
-            vectorized_forward_sim = jax.vmap(self.compute_forward_simulations, in_axes=(0,0,0), out_axes=0)
-            self.jit_vectorized_forward_sim = jax.jit(vectorized_forward_sim)
-            
-            threads = self.num_computations
-            
-            state_des = jnp.zeros((self.horizon, self.state_dim))
-            xs_des = jnp.tile(state_des, (self.num_computations,1)).reshape(self.num_computations, self.horizon, self.state_dim)
-            xs = jnp.zeros((self.state_dim*threads,)).reshape(threads,self.state_dim)
-            
-            key = random.PRNGKey(42)
-            parameters_map = random.randint(key,(self.num_parameters*threads,), minval=-200, maxval=200 )/100.
-            self.parameters_map = parameters_map.reshape(threads,self.num_parameters)
-            
-            self.jit_vectorized_forward_sim(xs, xs_des, self.parameters_map)
+        vectorized_forward_sim = jax.vmap(
+            self.compute_forward_simulations, in_axes=(0, None, 0), out_axes=0
+        )
+        self.jit_vectorized_forward_sim = jax.jit(vectorized_forward_sim)
+        vectorized_rollout = jax.vmap(
+            self.compute_rollout_trajectory, in_axes=(None, 0), out_axes=0
+        )
+        self.jit_vectorized_rollout = jax.jit(vectorized_rollout)
 
-            
-    def reset(self,):
-        """Every control class should have a reset function
-        """
-        return
-    
-    
+        if init_jax:
+            states = jnp.zeros((self.num_computations, self.state_dim))
+            goal = jnp.zeros(self.state_dim)
+            self.jit_vectorized_forward_sim(states, goal, self.parameters_map)
+
+    def reset(self):
+        self.previous_parameters = None
+
+    def _shift_previous_parameters(self):
+        """Advance the previous knot sequence by one controller time step."""
+        if self.interpolation == "zero_order":
+            previous = jnp.asarray(self.previous_parameters, dtype=jnp.float32)
+            previous_v = previous[: self.num_knots]
+            previous_w = previous[self.num_knots :]
+            shifted_v = jnp.concatenate((previous_v[1:], previous_v[-1:]))
+            shifted_w = jnp.concatenate((previous_w[1:], previous_w[-1:]))
+            return jnp.concatenate((shifted_v, shifted_w))
+
+        knot_grid = np.arange(self.num_knots, dtype=np.float32)
+        knot_shift = (self.num_knots - 1) / max(self.horizon - 1, 1)
+        shifted_grid = np.minimum(knot_grid + knot_shift, knot_grid[-1])
+        previous = np.asarray(self.previous_parameters)
+        shifted_v = np.interp(
+            shifted_grid, knot_grid, previous[: self.num_knots]
+        )
+        shifted_w = np.interp(
+            shifted_grid, knot_grid, previous[self.num_knots :]
+        )
+        return jnp.asarray(np.concatenate((shifted_v, shifted_w)), dtype=jnp.float32)
+
+    def _candidate_parameters(self):
+        """Build absolute samples or delta samples around the previous optimum."""
+        if not self.sample_deltas or self.previous_parameters is None:
+            return self.parameters_map
+
+        nominal_parameters = self._shift_previous_parameters()
+        candidates = nominal_parameters[None, :] + self.delta_parameters_map
+        candidate_v = jnp.clip(candidates[:, : self.num_knots], -1.2, 1.2)
+        candidate_w = jnp.clip(candidates[:, self.num_knots :], -2.0, 2.0)
+        return jnp.column_stack((candidate_v, candidate_w))
+
+    def _spline_position(self, step):
+        """Map a rollout step to a knot segment and its local coordinate."""
+        clipped_step = jnp.clip(step, 0, max(self.horizon - 1, 0))
+        knot_position = (
+            clipped_step
+            * (self.num_knots - 1)
+            / max(self.horizon - 1, 1)
+        )
+        segment = jnp.floor(knot_position).astype(jnp.int32)
+        segment = jnp.clip(segment, 0, self.num_knots - 2)
+        alpha = jnp.clip(knot_position - segment, 0.0, 1.0)
+        return segment, alpha
+
+    def compute_zero_order_hold(self, parameters, step):
+        """Return the independently sampled control for one horizon step."""
+        clipped_step = jnp.clip(step, 0, max(self.horizon - 1, 0))
+        knot_index = clipped_step.astype(jnp.int32)
+        v = parameters[knot_index]
+        w = parameters[self.num_knots + knot_index]
+        return v, w
+
     def compute_linear_spline(self, parameters, step):
-        index = 0
-        index = jax.numpy.where(step > self.horizon/4, 2, index)
-        index = jax.numpy.where(step > self.horizon/2, 4, index)
-        index = jax.numpy.where(step > self.horizon-10, 6, index) 
+        """Piecewise-linear interpolation through every velocity knot."""
+        segment, alpha = self._spline_position(step)
+        v_knots = parameters[: self.num_knots]
+        w_knots = parameters[self.num_knots :]
 
-        q = (step*0.01 - 0)/(self.horizon*0.01)
-        v = (1-q)*parameters[index+0] + q*parameters[index+1]
-        w = (1-q)*parameters[index+8] + q*parameters[index+9]
-
+        v = (1.0 - alpha) * v_knots[segment] + alpha * v_knots[segment + 1]
+        w = (1.0 - alpha) * w_knots[segment] + alpha * w_knots[segment + 1]
         return v, w
-    
+
     def compute_cubic_spline(self, parameters, step):
-        
-        q = (step*0.01 - 0)/(self.horizon*0.01)
-        
-        phi = (1./2.)*(((parameters[2] - parameters[1])/0.5) + ((parameters[1] - parameters[0])/0.5))
-        phi_next = (1./2.)*(((parameters[3] - parameters[2])/0.5) + ((parameters[2] - parameters[1])/0.5))
-        
-        a_v = 2*q*q*q - 3*q*q + 1
-        b_v = (q*q*q - 2*q*q + q)*0.5
-        c_v = -2*q*q*q + 3*q*q
-        d_v = (q*q*q - q*q)*0.5
-        v = a_v*parameters[1] + b_v*phi + c_v*parameters[2] + d_v*phi_next
+        """Piecewise cubic Hermite interpolation through every velocity knot.
 
-        phi = (1./2.)*(((parameters[6] - parameters[5])/0.5) + ((parameters[5] - parameters[4])/0.5))
-        phi_next = (1./2.)*(((parameters[7] - parameters[6])/0.5) + ((parameters[6] - parameters[5])/0.5))
-        
-        a_w = 2*q*q*q - 3*q*q + 1
-        b_w = (q*q*q - 2*q*q + q)*0.5
-        c_w = -2*q*q*q + 3*q*q
-        d_w = (q*q*q - q*q)*0.5
-        w = a_w*parameters[5] + b_w*phi + c_w*parameters[6] + d_w*phi_next
-       
+        Centred finite differences define the internal tangents; one-sided
+        differences are used at the two endpoints. The resulting profile is
+        continuous in both value and first derivative (C1).
+        """
+        segment, alpha = self._spline_position(step)
+
+        def interpolate(knots):
+            previous_index = jnp.maximum(segment - 1, 0)
+            next_next_index = jnp.minimum(segment + 2, self.num_knots - 1)
+            p0 = knots[previous_index]
+            p1 = knots[segment]
+            p2 = knots[segment + 1]
+            p3 = knots[next_next_index]
+
+            tangent_1 = jnp.where(
+                segment == 0, p2 - p1, 0.5 * (p2 - p0)
+            )
+            tangent_2 = jnp.where(
+                segment == self.num_knots - 2,
+                p2 - p1,
+                0.5 * (p3 - p1),
+            )
+
+            alpha_2 = alpha * alpha
+            alpha_3 = alpha_2 * alpha
+            h00 = 2.0 * alpha_3 - 3.0 * alpha_2 + 1.0
+            h10 = alpha_3 - 2.0 * alpha_2 + alpha
+            h01 = -2.0 * alpha_3 + 3.0 * alpha_2
+            h11 = alpha_3 - alpha_2
+            return h00 * p1 + h10 * tangent_1 + h01 * p2 + h11 * tangent_2
+
+        v = interpolate(parameters[: self.num_knots])
+        w = interpolate(parameters[self.num_knots :])
         return v, w
 
+    def _obstacle_cost(self, state):
+        delta = state[:2] - self.obstacles[:, :2]
+        centre_distance = jnp.sqrt(jnp.sum(delta**2, axis=1) + 1e-8)
+        clearance = centre_distance - self.obstacles[:, 2] - self.robot_radius
 
-    def compute_forward_simulations(self, initial_state, state_des, parameters):
-        """Calculate cost of a rollout of the dynamics given random parameters
-        Args:
-            initial_state (np.array): actual state of the robot
-            state_des (np.array): desired state of the robot
-            parameters (np.array): parameters for the controllers
-        Returns:
-            (float): cost of the rollout
-        """
-        state = initial_state
-        cost = 0.0
-    
-        def iterate_fun(n, carry):
-            cost, state, state_des = carry
+        safety_violation = jnp.maximum(self.safety_margin - clearance, 0.0)
+        soft_cost = self.obstacle_weight * jnp.sum(safety_violation**2)
+        collision_cost = self.collision_weight * jnp.sum(clearance <= 0.0)
+        return soft_cost + collision_cost
 
-            v, w = self.spline_fun(parameters, n)
-            #v, w = self.compute_linear_spline(parameters, n)
-            #v, w = self.compute_cubic_spline(parameters, n)
+    def compute_forward_simulations(self, initial_state, goal, parameters):
+        """Return the cost of one candidate control rollout."""
 
-            v = jax.numpy.where(v > 2.0, 2.0, v)
-            v = jax.numpy.where(v < -2.0, -2.0, v)
-            
-            w = jax.numpy.where(w > 2.0, 2.0, w)
-            w = jax.numpy.where(w < -2.0, -2.0, w)
+        def iterate_fun(step, carry):
+            cost, state = carry
+            v, w = self.control_profile_fun(parameters, step)
+            v = jnp.clip(v, -1.2, 1.2)
+            w = jnp.clip(w, -2.0, 2.0)
+            state_next = self.robot.integrate_jax(state, v, w)
 
-            state_next = self.robot.integrate_jax(state.reshape(self.state_dim,), v, w);
-            
-            error = state_next.reshape(self.state_dim, 1) - state_des[n].reshape(self.state_dim, 1)
-            cost_next = error[0]*1.0*error[0] + error[1]*1.0*error[1]
-            cost_next = [cost_next]
+            position_error = state_next[:2] - goal[:2]
+            goal_cost = self.goal_weight * jnp.sum(position_error**2)
+            effort_cost = self.control_weight * (v**2 + 0.1 * w**2)
+            obstacle_cost = self._obstacle_cost(state_next)
+            return cost + goal_cost + effort_cost + obstacle_cost, state_next
 
-            return (cost_next[0][0] + cost, state_next, state_des)
+        cost, final_state = jax.lax.fori_loop(
+            0, self.horizon, iterate_fun, (0.0, initial_state)
+        )
+        final_position_error = final_state[:2] - goal[:2]
+        heading_error = jnp.arctan2(
+            jnp.sin(final_state[2] - goal[2]),
+            jnp.cos(final_state[2] - goal[2]),
+        )
+        return (
+            cost
+            + self.terminal_goal_weight * jnp.sum(final_position_error**2)
+            + self.heading_weight * heading_error**2
+        )
 
-        carry = (cost, state, state_des)
-        cost, state, state_des = jax.lax.fori_loop(0, self.horizon, iterate_fun, carry)
-    
-        '''for n in range(0, self.horizon):
-            
-            index = 0
-            index = jax.numpy.where(n > self.horizon/4, 2, index)
-            index = jax.numpy.where(n > self.horizon/2, 4, index)
-            index = jax.numpy.where(n > self.horizon-10, 6, index)
-          
+    def compute_rollout_trajectory(self, initial_state, parameters):
+        """Simulate one rollout and return all its predicted states."""
 
-            q = (n*0.01 - 0)/(self.horizon*0.01)
-            v = (1-q)*parameters[index+0] + q*parameters[index+1]
-            w = (1-q)*parameters[index+8] + q*parameters[index+9]
-            
+        def integrate_step(state, step):
+            v, w = self.control_profile_fun(parameters, step)
+            v = jnp.clip(v, -1.2, 1.2)
+            w = jnp.clip(w, -2.0, 2.0)
+            state_next = self.robot.integrate_jax(state, v, w)
+            return state_next, state_next
 
-            v = jax.numpy.where(v > 2.0, 2.0, v)
-            v = jax.numpy.where(v < -2.0, -2.0, v)
-            
-            w = jax.numpy.where(w > 2.0, 2.0, w)
-            w = jax.numpy.where(w < -2.0, -2.0, w)
+        _, predicted_states = jax.lax.scan(
+            integrate_step, initial_state, jnp.arange(self.horizon)
+        )
+        return jnp.vstack((initial_state, predicted_states))
 
-            
-            #print("state_des inside", state_des)
-            #print("state_des inside[n]", state_des[n])
-            #state_des_single = jnp.array([state_des[n][0], state_des[n][1], 0.0])
-            #print("state_des_single", state_des_single.reshape(3,1))
-            state = self.robot.integrate_jax(state.reshape(self.state_dim,), v, w)
-            error = state.reshape(self.state_dim,1) - state_des[n].reshape(self.state_dim,1)
-            
+    def get_rollout_trajectories(self, state, parameter_indices):
+        """Return selected sampled rollouts for visualization only."""
+        candidate_parameters = self._candidate_parameters()
+        selected_parameters = candidate_parameters[jnp.asarray(parameter_indices)]
+        trajectories = self.jit_vectorized_rollout(
+            jnp.asarray(state, dtype=jnp.float32), selected_parameters
+        )
+        return np.asarray(trajectories)
 
-            cost_next = error[0]*1.0*error[0] + error[1]*1.0*error[1] + error[2]*0.001*error[2]*0.0
-            cost_next = [cost_next]
-            #cost_next = (state.reshape(self.state_dim,1) - state_des.reshape(self.state_dim,1)).T@self.Q@(state.reshape(self.state_dim,1) - state_des.reshape(self.state_dim,1))
-            
-            
-            #state = state_next
-            cost = cost + cost_next[0][0]'''
-        
-        return cost
-    
-    
-    def compute_control(self, state, reference_x, reference_y):
-        """Compute control inputs
-        Args:
-            state (np.array): actual robot state
-            state_des (np.array): desired robot state
-        Returns:
-            (np.array): optimized control inputs
-        """
-        reference_x = jnp.asarray(reference_x)
-        reference_y = jnp.asarray(reference_y)
-        reference_theta = jnp.zeros(self.horizon)
-        
-        state_vec = jnp.tile(state, (self.num_computations,1))
-        state_des = jnp.column_stack((reference_x, reference_y, reference_theta))
-        state_des_vec = jnp.tile(state_des, (self.num_computations,1)).reshape(self.num_computations, self.horizon, self.state_dim)
-        
-        #time_start = time.time()
-        #key = random.PRNGKey(42)
-        #parameters_map = random.randint(key,(self.num_parameters*1,), minval=-200, maxval=200 )/100.
+    def compute_control(self, state, goal):
+        """Compute ``(linear_velocity, angular_velocity)`` toward one goal."""
+        state = jnp.asarray(state, dtype=jnp.float32)
+        goal = jnp.asarray(goal, dtype=jnp.float32)
 
-        
-        time_start = time.time()
-        cost = self.jit_vectorized_forward_sim(state_vec, state_des_vec, self.parameters_map)
-        #print("cost computation time: ", time.time()-time_start)
+        distance = np.linalg.norm(np.asarray(goal[:2] - state[:2]))
+        if distance <= self.goal_tolerance:
+            return 0.0, 0.0
 
-        best_index = jnp.nanargmin(cost)
-        best_parameters = self.parameters_map[best_index]
-        #time_start = time.time()
-        v, w = self.spline_fun(best_parameters, 0)
-        print("computation time: ", time.time()-time_start)
-
-        return np.float64(v), np.float64(w)
+        candidate_parameters = self._candidate_parameters()
+        state_batch = jnp.tile(state, (self.num_computations, 1))
+        start_time = time.time()
+        costs = self.jit_vectorized_forward_sim(
+            state_batch, goal, candidate_parameters
+        )
+        best_parameters = candidate_parameters[jnp.nanargmin(costs)]
+        if self.sample_deltas:
+            self.previous_parameters = best_parameters
+        v, w = self.control_profile_fun(best_parameters, 0)
+        print("computation time:", time.time() - start_time)
+        return float(v), float(w)
 
 
-
-
-if __name__=="__main__":
-    control = Sampling_MPC(dt=0.01, horizon=20, init_jax = True, num_computations = 1000)
-
-    x = jnp.array([0.0, 0.0, 0.0])
-    x_des = jnp.array([1.0, -0.7, 0.0])
-    reference_x = []
-    reference_y = []
-    reference_theta = []
-    for i in range(control.horizon):
-            reference_x.append(x_des[0])
-            reference_y.append(x_des[1])
-            reference_theta.append(0.0)
-    state_des = jnp.column_stack(
-        (jnp.asarray(reference_x), jnp.asarray(reference_y), jnp.asarray(reference_theta))
+def run_demo():
+    # Set to True to sample delta-v and delta-w around the previous solution.
+    obstacles = np.array(
+        [
+            [1.20, 0.35, 0.28],
+            [2.15, 1.05, 0.35],
+            [3.05, 1.35, 0.30],
+        ],
+        dtype=np.float32,
+    )
+    goal = jnp.array([4.0, 2.0, 0.0])
+    state = jnp.array([0.0, 0.0, 0.0])
+    controller = Sampling_MPC(
+        obstacles=obstacles,
+        interpolation="cubic",  # "zero_order", "linear", or "cubic"
+        sample_deltas=True,
+        delta_v_max=0.25,
+        delta_w_max=0.50,
     )
 
-    #threads = 2
-    xs = jnp.tile(x, (control.num_computations,1)).reshape(control.num_computations, control.state_dim)
-    xs_des = jnp.tile(state_des, (control.num_computations,1)).reshape(control.num_computations, control.horizon, control.state_dim)
+    state_history = [np.asarray(state)]
+    control_history = []
+    rollout_history = []
+    visualization_rng = np.random.default_rng(7)
+    number_of_visible_rollouts = min(10, controller.num_computations)
 
-    key = random.PRNGKey(42)
-    parameters_map = random.randint(key,(control.num_parameters*control.num_computations,), minval=-200, maxval=200 )/100.0
-    parameters_map = parameters_map.reshape(control.num_computations,control.num_parameters)
+    for step in range(300):
+        if np.linalg.norm(np.asarray(state[:2] - goal[:2])) <= controller.goal_tolerance:
+            print(f"Goal raggiunto in {step} passi")
+            break
 
-  
+        visible_indices = visualization_rng.choice(
+            controller.num_computations,
+            size=number_of_visible_rollouts,
+            replace=False,
+        )
+        rollout_history.append(
+            controller.get_rollout_trajectories(state, visible_indices)
+        )
+        v, w = controller.compute_control(state, goal)
+        control_history.append([v, w])
+        state = controller.robot.integrate_jax(state, v, w)
+        state_history.append(np.asarray(state))
+    else:
+        print("Goal non raggiunto entro il numero massimo di passi")
 
-    # single computation test ------------------------------------
-    '''start_time = time.time()
-    cost = control.compute_forward_simulations(xs[0], xs_des[0], parameters_map[0])
-    print("non-compiled single jax: ", time.time()-start_time)
+    visible_indices = visualization_rng.choice(
+        controller.num_computations,
+        size=number_of_visible_rollouts,
+        replace=False,
+    )
+    rollout_history.append(controller.get_rollout_trajectories(state, visible_indices))
 
-    v_fd = jax.vmap(control.compute_forward_simulations, in_axes=(0,0,0), out_axes=0)
-    start_time = time.time()
-    cost = v_fd(xs, xs_des, parameters_map)
-    print("non-compiled multi jax: ", time.time()-start_time)
-    
+    state_history = np.asarray(state_history)
+    control_history = np.asarray(control_history)
+    output_directory = Path(__file__).resolve().parent
+    gif_path = output_directory / "ddrive_navigation.gif"
+    controls_path = output_directory / "ddrive_control_profiles.png"
 
-    #start_time = time.time()
-    #jit_fd = jax.jit(control.compute_forward_simulations)
-    #print("compilation jax: ", time.time()-start_time)
-    
-    #start_time = time.time() 
-    #cost = jit_fd(x, x_des, parameters[0])
-    #print("compiled jax: ", time.time()-start_time)
-    #print("cost: ", cost)
-    
-    #start_time = time.time()
-    #cost = jit_fd(x, x_des, parameters[0])
-    #print("compiled jax single: ", time.time()-start_time)
-    
+    figure, axis = plt.subplots(num="Point-to-point obstacle avoidance")
+    axis.scatter(state_history[0, 0], state_history[0, 1], marker="o", label="start")
+    axis.scatter(float(goal[0]), float(goal[1]), marker="*", s=160, label="goal")
 
-    # parallel computation test ------------------------------------
-    threads = 2
-    xs = jnp.tile(x, (threads,1)).reshape(threads,control.state_dim)
-    xs_des = jnp.tile(x_des, (threads,1)).reshape(threads,control.state_dim)
+    for obstacle_x, obstacle_y, obstacle_radius in obstacles:
+        axis.add_patch(
+            plt.Circle((obstacle_x, obstacle_y), obstacle_radius, color="tab:red", alpha=0.6)
+        )
+        axis.add_patch(
+            plt.Circle(
+                (obstacle_x, obstacle_y),
+                obstacle_radius + controller.robot_radius + controller.safety_margin,
+                fill=False,
+                linestyle="--",
+                color="tab:red",
+                alpha=0.5,
+            )
+        )
 
-    
-    key = random.PRNGKey(42)
-    parameters_map = random.randint(key,(control.num_parameters*threads,), minval=-200, maxval=200 )/100.0
-    parameters_map = parameters_map.reshape(threads,control.num_parameters)
+    axis.set_xlabel("x [m]")
+    axis.set_ylabel("y [m]")
+    axis.set_aspect("equal", adjustable="box")
+    axis.grid(True)
+    axis.legend()
 
-  
-    
-    v_fd = jax.vmap(control.compute_forward_simulations, in_axes=(0,0,0), out_axes=0)
-    start_time = time.time()
-    cost = v_fd(xs, xs_des, parameters_map)
-    #print("non compiled VMAP jax: ", time.time()-start_time)
-    #print("costs_out", cost)
-    #print("minimum cost", np.nanmin(cost))
-    min_cost_index = np.nanargmin(cost)
-    #print("minimum cost index", min_cost_index)
-    #print("best parameters", parameters_map[min_cost_index])'''
-    
-    #start_time = time.time()
-    '''jit_v_fd = jax.jit(v_fd)
-    #print("parallel compilation jax: ", time.time()-start_time)
+    environment_points = np.vstack((state_history[:, :2], obstacles[:, :2], np.asarray(goal[:2])[None, :]))
+    lower_bounds = np.min(environment_points, axis=0) - 0.8
+    upper_bounds = np.max(environment_points, axis=0) + 0.8
+    axis.set_xlim(lower_bounds[0], upper_bounds[0])
+    axis.set_ylim(lower_bounds[1], upper_bounds[1])
 
-    #start_time = time.time()
-    costs = jit_v_fd(xs, xs_des, parameters_map)
-    #print("parallel compiled jax: ", time.time()-start_time)
-    #print("costs", costs)
+    path_line, = axis.plot([], [], color="tab:blue", linewidth=2.5, label="robot path")
+    robot_body = plt.Circle(
+        (state_history[0, 0], state_history[0, 1]),
+        controller.robot_radius,
+        color="tab:blue",
+        alpha=0.85,
+        zorder=5,
+    )
+    axis.add_patch(robot_body)
+    heading_line, = axis.plot([], [], color="white", linewidth=2.0, zorder=6)
 
-    start_time = time.time()
-    costs = jit_v_fd(xs, xs_des, parameters_map)
-    #print("costs_out", costs)
-    #print("minimum cost", np.nanmin(costs))
-    #print("parallel VMAP jax: ", time.time()-start_time)
-    
-    x = jnp.array([0, 0.2, 0.4])
-    x_des = jnp.array([0, 0.0, 0])
-    xs = jnp.tile(x, (threads,1)).reshape(threads,3)    
-    xs_des = jnp.tile(x_des, (threads,1)).reshape(threads,3)
-    start_time = time.time()
-    costs = jit_v_fd(xs, xs_des, parameters_map)
-    #print("costs_out", costs)
-    print("minimum cost", np.nanmin(costs))
-    print("parallel VMAP jax changing init state: ", time.time()-start_time)'''
-    
- 
-    '''start_time = time.time()
-    for i in range(0,threads):
-        parameters = np.random.rand(control.num_parameters,1).reshape(-1,control.num_parameters)
-        #cost = jit_fd(x, x_des, parameters[i])
-        cost = control.compute_forward_simulations(x, x_des, parameters[0])
-        #cost = control.compute_forward_simulation(x, x_des)
-        print(cost)
-    print("non parallel compiled jax: ", time.time()-start_time)'''
+    rollout_colors = visualization_rng.random((number_of_visible_rollouts, 3))
+    rollout_lines = [
+        axis.plot([], [], color=color, alpha=0.65, linewidth=1.0)[0]
+        for color in rollout_colors
+    ]
 
-    
-    
-    
+    def update_animation(frame):
+        current_state = state_history[frame]
+        path_line.set_data(state_history[: frame + 1, 0], state_history[: frame + 1, 1])
+        robot_body.center = (current_state[0], current_state[1])
+        heading_end = current_state[:2] + controller.robot_radius * np.array(
+            [np.cos(current_state[2]), np.sin(current_state[2])]
+        )
+        heading_line.set_data(
+            [current_state[0], heading_end[0]],
+            [current_state[1], heading_end[1]],
+        )
+        for line, rollout in zip(rollout_lines, rollout_history[frame]):
+            line.set_data(rollout[:, 0], rollout[:, 1])
+        axis.set_title(
+            f"Sampling MPC ({controller.interpolation}) - "
+            f"t = {frame * controller.dt:.2f} s"
+        )
+        return [path_line, robot_body, heading_line, *rollout_lines]
 
-    state_evolution = [copy.copy(x)]
-    for j in range(0,1000):
-        print("State_robot: ", x)
-        state_evolution = np.append(state_evolution, [copy.copy(x)], axis=0)
+    animation = FuncAnimation(
+        figure,
+        update_animation,
+        frames=len(state_history),
+        interval=1000 / 12,
+        blit=False,
+        cache_frame_data=False,
+    )
+    animation.save(gif_path, writer=PillowWriter(fps=12), dpi=90)
+    print(f"GIF salvata in: {gif_path}")
 
-        start_time = time.time()
+    control_figure, (axis_v, axis_w) = plt.subplots(
+        2, 1, sharex=True, num="Control profiles", constrained_layout=True
+    )
+    control_time = np.arange(len(control_history)) * controller.dt
+    axis_v.plot(control_time, control_history[:, 0], color="tab:blue")
+    axis_v.set_ylabel("v [m/s]")
+    axis_v.grid(True)
+    axis_w.plot(control_time, control_history[:, 1], color="tab:orange")
+    axis_w.set_xlabel("time [s]")
+    axis_w.set_ylabel("ω [rad/s]")
+    axis_w.grid(True)
+    control_figure.savefig(controls_path, dpi=160)
+    print(f"Profili di controllo salvati in: {controls_path}")
 
-        reference_x = []
-        reference_y = []
-        reference_theta = []
-        for i in range(control.horizon):
-                reference_x.append(x_des[0])
-                reference_y.append(x_des[1])
-                reference_theta.append(0.0)
-
-        v, w = control.compute_control(x, reference_x, reference_y)
-        
-        print("Control actions: ", [v, w])
-        print("Control time: ", time.time()-start_time)
-        x = control.robot.integrate_jax(x, v, w)
-        print("##############################")
-
-
-    plt.figure("Tracking Performance x-y") 
-    plt.plot(state_evolution[:,1],state_evolution[:,0])
-    #plt.plot(path_spline_x[:],path_spline_y[:])
-    plt.ylabel('y')
-    plt.xlabel('x')
     plt.show()
+    return gif_path, controls_path
+
+
+if __name__ == "__main__":
+    run_demo()
