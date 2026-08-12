@@ -34,15 +34,15 @@ class Sampling_MPC:
         self,
         horizon=80,
         dt=0.05,
-        num_computations=2000,
+        num_computations=1000,
         init_jax=True,
-        interpolation="cubic",
+        interpolation="zero_order",
         obstacles=None,
         robot_radius=0.15,
         safety_margin=0.15,
         goal_tolerance=0.10,
         seed=42,
-        sample_deltas=False,
+        sample_deltas=True,
         delta_v_max=0.25,
         delta_w_max=0.50,
     ):
@@ -78,7 +78,7 @@ class Sampling_MPC:
         self.interpolation = interpolation
         # Zero order samples one independent (v, w) pair per horizon step.
         # Linear and cubic interpolation use eight knots per control profile.
-        self.num_knots = self.horizon if interpolation == "zero_order" else 8
+        self.num_knots = self.horizon if interpolation == "zero_order" else 20
         self.num_parameters = 2 * self.num_knots
         interpolation_functions = {
             "zero_order": self.compute_zero_order_hold,
@@ -285,8 +285,8 @@ class Sampling_MPC:
 
         def integrate_step(state, step):
             v, w = self.control_profile_fun(parameters, step)
-            v = jnp.clip(v, -1.2, 1.2)
-            w = jnp.clip(w, -2.0, 2.0)
+            v = jnp.clip(v, -1.0, 1.0)
+            w = jnp.clip(w, -1.0, 1.0)
             state_next = self.robot.integrate_jax(state, v, w)
             return state_next, state_next
 
@@ -312,10 +312,9 @@ class Sampling_MPC:
         distance = np.linalg.norm(np.asarray(goal[:2] - state[:2]))
         if distance <= self.goal_tolerance:
             return 0.0, 0.0
-
+        start_time = time.time()
         candidate_parameters = self._candidate_parameters()
         state_batch = jnp.tile(state, (self.num_computations, 1))
-        start_time = time.time()
         costs = self.jit_vectorized_forward_sim(
             state_batch, goal, candidate_parameters
         )
@@ -341,8 +340,6 @@ def run_demo():
     state = jnp.array([0.0, 0.0, 0.0])
     controller = Sampling_MPC(
         obstacles=obstacles,
-        interpolation="cubic",  # "zero_order", "linear", or "cubic"
-        sample_deltas=True,
         delta_v_max=0.25,
         delta_w_max=0.50,
     )
@@ -384,7 +381,10 @@ def run_demo():
     control_history = np.asarray(control_history)
     output_directory = Path(__file__).resolve().parent
     gif_path = output_directory / "ddrive_navigation.gif"
+    initial_scene_path = output_directory / "ddrive_initial_environment.png"
     controls_path = output_directory / "ddrive_control_profiles.png"
+    figure_dpi = 220
+    gif_dpi = 160
 
     figure, axis = plt.subplots(num="Point-to-point obstacle avoidance")
     axis.scatter(state_history[0, 0], state_history[0, 1], marker="o", label="start")
@@ -409,7 +409,7 @@ def run_demo():
     axis.set_ylabel("y [m]")
     axis.set_aspect("equal", adjustable="box")
     axis.grid(True)
-    axis.legend()
+    axis.legend(loc="upper left")
 
     environment_points = np.vstack((state_history[:, :2], obstacles[:, :2], np.asarray(goal[:2])[None, :]))
     lower_bounds = np.min(environment_points, axis=0) - 0.8
@@ -427,6 +427,17 @@ def run_demo():
     )
     axis.add_patch(robot_body)
     heading_line, = axis.plot([], [], color="white", linewidth=2.0, zorder=6)
+
+    initial_heading_end = state_history[0, :2] + controller.robot_radius * np.array(
+        [np.cos(state_history[0, 2]), np.sin(state_history[0, 2])]
+    )
+    heading_line.set_data(
+        [state_history[0, 0], initial_heading_end[0]],
+        [state_history[0, 1], initial_heading_end[1]],
+    )
+    #axis.set_title(f"Sampling MPC")
+    figure.savefig(initial_scene_path, dpi=figure_dpi, bbox_inches="tight")
+    print(f"Immagine iniziale salvata in: {initial_scene_path}")
 
     rollout_colors = visualization_rng.random((number_of_visible_rollouts, 3))
     rollout_lines = [
@@ -448,7 +459,7 @@ def run_demo():
         for line, rollout in zip(rollout_lines, rollout_history[frame]):
             line.set_data(rollout[:, 0], rollout[:, 1])
         axis.set_title(
-            f"Sampling MPC ({controller.interpolation}) - "
+            f"K = {controller.num_computations}, "
             f"t = {frame * controller.dt:.2f} s"
         )
         return [path_line, robot_body, heading_line, *rollout_lines]
@@ -461,7 +472,7 @@ def run_demo():
         blit=False,
         cache_frame_data=False,
     )
-    animation.save(gif_path, writer=PillowWriter(fps=12), dpi=90)
+    animation.save(gif_path, writer=PillowWriter(fps=12), dpi=gif_dpi)
     print(f"GIF salvata in: {gif_path}")
 
     control_figure, (axis_v, axis_w) = plt.subplots(
@@ -475,11 +486,11 @@ def run_demo():
     axis_w.set_xlabel("time [s]")
     axis_w.set_ylabel("ω [rad/s]")
     axis_w.grid(True)
-    control_figure.savefig(controls_path, dpi=160)
+    control_figure.savefig(controls_path, dpi=figure_dpi, bbox_inches="tight")
     print(f"Profili di controllo salvati in: {controls_path}")
 
     plt.show()
-    return gif_path, controls_path
+    return gif_path, initial_scene_path, controls_path
 
 
 if __name__ == "__main__":
