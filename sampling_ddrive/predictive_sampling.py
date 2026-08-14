@@ -1,9 +1,9 @@
 import os
 
-# Force this process to use only the CPU. These variables must be set before
-# importing JAX, including indirectly through robot_model.
-os.environ["CUDA_VISIBLE_DEVICES"] = ""
-os.environ["JAX_PLATFORMS"] = "cpu"
+# Use the CPU by default, while allowing callers such as the benchmark script
+# to select another JAX backend before importing this module.
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
+os.environ.setdefault("JAX_PLATFORMS", "cpu")
 
 import time
 from pathlib import Path
@@ -34,7 +34,7 @@ class Sampling_MPC:
         self,
         horizon=80,
         dt=0.05,
-        num_computations=10,
+        num_computations=100,
         init_jax=True,
         interpolation="zero_order",
         obstacles=None,
@@ -42,7 +42,7 @@ class Sampling_MPC:
         safety_margin=0.15,
         goal_tolerance=0.10,
         seed=42,
-        sample_deltas=False,
+        sample_deltas=True,
         delta_v_max=0.25,
         delta_w_max=0.50,
         print_computation_time=True,
@@ -352,8 +352,10 @@ def run_demo():
     state = jnp.array([0.0, 0.0, 0.0])
     controller = Sampling_MPC(
         obstacles=obstacles,
-        delta_v_max=0.25,
-        delta_w_max=0.50,
+        interpolation="linear",
+        delta_v_max=0.05,
+        delta_w_max=0.05,
+        sample_deltas=True,
     )
 
     state_history = [np.asarray(state)]

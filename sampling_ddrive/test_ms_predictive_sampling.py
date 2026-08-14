@@ -3,10 +3,12 @@
 Examples:
     python3 test_ms_predictive_sampling.py
     python3 test_ms_predictive_sampling.py --cpu-cores 1
+    python3 test_ms_predictive_sampling.py --backend gpu
     python3 test_ms_predictive_sampling.py --repetitions 200 --cpu-cores 0
 
 ``--cpu-cores 0`` leaves CPU parallelism under JAX/XLA control. A positive
-value limits the common CPU thread pools before JAX is imported.
+value limits the common CPU thread pools before JAX is imported. The option is
+ignored when ``--backend gpu`` is selected.
 """
 
 import argparse
@@ -20,10 +22,16 @@ from pathlib import Path
 def parse_arguments():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
+        "--backend",
+        choices=("cpu", "gpu"),
+        default="cpu",
+        help="JAX backend used by the benchmark (default: cpu).",
+    )
+    parser.add_argument(
         "--cpu-cores",
         type=int,
         choices=(0, 1),
-        default=1,
+        default=0,
         help="0 uses JAX parallelism; 1 confines the process to one CPU core.",
     )
     parser.add_argument(
@@ -53,10 +61,14 @@ def parse_arguments():
     return parser.parse_args()
 
 
-def configure_cpu(cpu_cores):
-    """Configure thread limits before importing JAX."""
+def configure_backend(backend, cpu_cores):
+    """Select the JAX backend and configure CPU limits before importing it."""
+    os.environ["JAX_PLATFORMS"] = "cuda" if backend == "gpu" else "cpu"
+    if backend == "gpu":
+        os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+        return
+
     os.environ["CUDA_VISIBLE_DEVICES"] = ""
-    os.environ["JAX_PLATFORMS"] = "cpu"
     if cpu_cores == 0:
         return
 
@@ -100,7 +112,7 @@ def write_statistics(path, statistics):
         writer.writerows(statistics)
 
 
-def save_plot(path, samples_by_k, cpu_cores):
+def save_plot(path, samples_by_k, backend, cpu_cores):
     import matplotlib.pyplot as plt
 
     k_values = list(samples_by_k)
@@ -122,10 +134,13 @@ def save_plot(path, samples_by_k, cpu_cores):
     )
     axis.set_xlabel("K — number of sampled rollouts")
     axis.set_ylabel("compute_control [ms]")
-    axis.set_title(
-        "Zero-order predictive sampling — "
-        + ("JAX parallelism automatic" if cpu_cores == 0 else f"{cpu_cores} CPU core(s)")
-    )
+    if backend == "gpu":
+        execution_label = "GPU"
+    elif cpu_cores == 0:
+        execution_label = "CPU, JAX parallelism automatic"
+    else:
+        execution_label = f"{cpu_cores} CPU core(s)"
+    axis.set_title(f"Zero-order predictive sampling — {execution_label}")
     axis.grid(True, which="both", axis="y", alpha=0.35)
     figure.savefig(path, dpi=180)
     plt.close(figure)
@@ -133,7 +148,7 @@ def save_plot(path, samples_by_k, cpu_cores):
 
 def main():
     arguments = parse_arguments()
-    configure_cpu(arguments.cpu_cores)
+    configure_backend(arguments.backend, arguments.cpu_cores)
 
     # predictive_sampling imports robot_model as a sibling module.
     sampling_directory = Path(__file__).resolve().parent
@@ -142,7 +157,22 @@ def main():
     import jax
     import jax.numpy as jnp
     import numpy as np
+
+    try:
+        selected_backend = jax.default_backend()
+    except Exception as error:
+        raise SystemExit(
+            f"Unable to initialize the requested JAX backend "
+            f"{arguments.backend!r}: {error}"
+        ) from error
+
     from predictive_sampling import Sampling_MPC
+
+    if selected_backend != arguments.backend:
+        raise RuntimeError(
+            f"Requested JAX backend {arguments.backend!r}, but JAX selected "
+            f"{selected_backend!r}. Available devices: {jax.devices()}"
+        )
 
     k_values = (10, 500, 2000, 10000)
     state = jnp.array([0.0, 0.0, 0.0], dtype=jnp.float32)
@@ -154,9 +184,13 @@ def main():
 
     samples_by_k = {}
     statistics = []
-    print("JAX backend:", jax.default_backend())
+    print("JAX backend:", selected_backend)
     print("JAX devices:", jax.devices())
-    print("CPU cores setting:", "automatic" if arguments.cpu_cores == 0 else arguments.cpu_cores)
+    if arguments.backend == "cpu":
+        print(
+            "CPU cores setting:",
+            "automatic" if arguments.cpu_cores == 0 else arguments.cpu_cores,
+        )
 
     for num_computations in k_values:
         controller = Sampling_MPC(
@@ -192,13 +226,20 @@ def main():
         )
 
     arguments.output_dir.mkdir(parents=True, exist_ok=True)
-    suffix = "auto" if arguments.cpu_cores == 0 else f"{arguments.cpu_cores}_core"
+    if arguments.backend == "gpu":
+        suffix = "gpu"
+    else:
+        suffix = (
+            "auto"
+            if arguments.cpu_cores == 0
+            else f"{arguments.cpu_cores}_core"
+        )
     statistics_path = arguments.output_dir / f"predictive_sampling_stats_{suffix}.csv"
     samples_path = arguments.output_dir / f"predictive_sampling_samples_{suffix}.csv"
     plot_path = arguments.output_dir / f"predictive_sampling_benchmark_{suffix}.png"
     write_statistics(statistics_path, statistics)
     write_raw_samples(samples_path, samples_by_k)
-    save_plot(plot_path, samples_by_k, arguments.cpu_cores)
+    save_plot(plot_path, samples_by_k, arguments.backend, arguments.cpu_cores)
     print("Statistics:", statistics_path)
     print("Raw samples:", samples_path)
     print("Plot:", plot_path)

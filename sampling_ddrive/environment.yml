@@ -1,0 +1,12 @@
+name: sampling_slides_turrisi_env
+channels:
+  - conda-forge
+
+dependencies:
+  - python=3.12
+  - pip
+  - pip:
+      - "jax[cuda13]"
+      - matplotlib
+      - numpy
+      - pillow
