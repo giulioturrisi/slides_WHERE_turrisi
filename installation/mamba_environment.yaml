@@ -1,0 +1,31 @@
+name: lessons_turrisi_env
+channels:
+  - conda-forge
+
+# Run from the repository root:
+#   mamba env create -f installation/mamba_environment.yaml
+#   mamba activate exercise_turrisi_env
+#   jupyter lab
+# To update an existing environment:
+#   mamba env update -f installation/mamba_environment.yaml
+dependencies:
+  - python=3.12
+  - pip
+
+  # Numerical examples, plots and GIF animations.
+  - numpy
+  - matplotlib
+  - pillow
+  - tqdm
+  - casadi
+
+  # Notebook interface and Python kernel (also usable from VS Code).
+  - jupyterlab
+  - ipykernel
+  - ipython
+
+  - pip:
+      # CPU installation: no CUDA or NVIDIA GPU required.
+      - jax
+      # Pendulum-v1, including rendering dependencies.
+      - "gymnasium[classic-control]"
