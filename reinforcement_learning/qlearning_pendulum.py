@@ -22,6 +22,7 @@ VELOCITY_BINS = 40
 TORQUES = np.array([-2.0, -1.0, 0.0, 1.0, 2.0], dtype=np.float32)
 ALPHA = 0.1  # Learning rate: how much each new target changes a Q value.
 GAMMA = 0.99  # Discount factor: how much future rewards matter.
+HORIZON = 200  # Maximum number of control steps per episode.
 SEED = 42
 
 
@@ -49,9 +50,9 @@ def train(episodes):
             state = discretize(observation)
             total_reward = 0.0
             # Start with random exploration; gradually favor learned actions.
-            #epsilon = max(0.05, 1.0 - episode / max(1, 0.8 * episodes))
-            epsilon = 0.3
-            while True:
+            epsilon = max(0.05, 1.0 - episode / max(1, 0.8 * episodes))
+            #epsilon = 0.0001
+            for _ in range(HORIZON):
                 if rng.random() < epsilon:
                     action = int(rng.integers(len(TORQUES)))
                 else:
