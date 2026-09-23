@@ -7,10 +7,11 @@ Coordinates are (x, y), starting at (1, 1) in the bottom-left corner.
 Actions succeed with probability 0.8. With probability 0.1 each, the agent
 moves in either perpendicular direction instead (no backward slip).
 Hitting a wall leaves the agent in the same cell, without redistributing
-that outcome's probability. Rewards are received when ENTERING a cell:
+that outcome's probability. Rewards belong to the CURRENT state R(s):
     (4, 4): +1, terminal (treasure)
     (4, 3): -1, terminal (fire)
     all other cells: 0
+Terminal rewards are received once, with no continuation: V(terminal) = R(terminal).
 The start cell (2, 1) is marked S, but value iteration updates ALL states.
 """
 
@@ -26,13 +27,13 @@ STATES = [(x, y) for y in range(1, SIZE + 1) for x in range(1, SIZE + 1)]
 
 
 def transition(state, action):
-    """Return the next state and reward for one realized movement."""
+    """Return the next state and current-state reward R(s) for one movement."""
     if state in TERMINALS:
-        return state, 0.0  # The episode has ended; no further rewards.
+        return state, TERMINALS[state]  # Terminal payoff; no continuation in Bellman.
     x, y = state
     dx, dy = action
     next_state = (min(SIZE, max(1, x + dx)), min(SIZE, max(1, y + dy)))
-    reward = TERMINALS.get(next_state, 0.0)
+    reward = TERMINALS.get(state, 0.0)
     return next_state, reward
 
 
@@ -54,13 +55,13 @@ def bellman_update(values):
     new_values = {}
     for state in STATES:
         if state in TERMINALS:
-            # V(terminal) = 0: its entry reward has already been received.
-            new_values[state] = 0.0
+            # Terminal reward is received once, without a continuation value.
+            new_values[state] = TERMINALS[state]
             continue
         action_values = []
         for action in ACTIONS:
             # Average over possible outcomes BEFORE maximizing over actions:
-            # Q(s,a) = sum P(s'|s,a) * [R(s,a,s') + gamma * V(s')].
+            # Q(s,a) = sum P(s'|s,a) * [R(s) + gamma * V(s')].
             # Use exact probabilities, not randomly sampled transitions.
             expected_value = sum(
                 probability * (reward + GAMMA * values[next_state])
@@ -102,10 +103,10 @@ def plot_values(ax, values, iteration):
 def main():
     import matplotlib.pyplot as plt
 
-    values = {state: 0.0 for state in STATES}
+    values = {state: TERMINALS.get(state, 0.0) for state in STATES}
     plt.ion()  # Refresh the same window as value iteration progresses.
     fig, ax = plt.subplots(figsize=(7, 7))
-    fig.text(0.5, 0.02, "Rewards are paid on entry; terminal values are zero.",
+    fig.text(0.5, 0.02, "Current-state rewards R(s); terminal values equal their rewards.",
              ha="center", fontsize=10)
     plot_values(ax, values, 0)
     fig.tight_layout(rect=(0, 0.05, 1, 1))
