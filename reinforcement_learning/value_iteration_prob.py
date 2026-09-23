@@ -61,7 +61,7 @@ def bellman_update(values):
         action_values = []
         for action in ACTIONS:
             # Average over possible outcomes BEFORE maximizing over actions:
-            # Q(s,a) = sum P(s'|s,a) * [R(s) + gamma * V(s')].
+            # V_new(s) = max_a sum P(s'|s,a) * [R(s) + gamma * V_old(s')].
             # Use exact probabilities, not randomly sampled transitions.
             expected_value = sum(
                 probability * (reward + GAMMA * values[next_state])

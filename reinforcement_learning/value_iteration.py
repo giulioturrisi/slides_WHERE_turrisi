@@ -45,7 +45,7 @@ def bellman_update(values):
         action_values = []
         for action in ACTIONS:
             next_state, reward = transition(state, action)
-            # Q(s,a) = R(s) + gamma * V(s'). No sampling is needed.
+            # V_new(s) = max_a [R(s) + gamma * V_old(s')].
             action_values.append(reward + GAMMA * values[next_state])
         new_values[state] = max(action_values)
     # Every state uses the PREVIOUS sweep, independent of iteration order.
