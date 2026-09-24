@@ -1,7 +1,7 @@
 """Vanilla policy gradient with a learned value baseline.
 
 Install: python3 -m pip install numpy matplotlib
-Quick check: python3 vanilla_policy_gradient_double_pendulum_baseline.py --updates 2 --no-plot --no-render
+Quick check: python3 a2c.py --updates 2 --no-plot --no-render
 
 The actor is the same Gaussian policy used by
 vanilla_policy_gradient_double_pendulum.py. A linear value baseline is fitted
